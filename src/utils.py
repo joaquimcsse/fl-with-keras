@@ -2,7 +2,8 @@ from itertools import tee, islice, chain
 
 def previous_and_current(some_iterable):
     """
-        Easy iteration tool for use in the inputs/models dicts
+        Tool for training and testing models with data from different cicles
+            in arrays stored in a dictionary
     """
     prevs, items = tee(some_iterable, 2)
     prevs = chain([None], prevs)

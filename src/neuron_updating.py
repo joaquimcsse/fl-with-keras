@@ -5,77 +5,153 @@ from tensorflow.keras.optimizers import Adam
 
 import random as python_random
 import numpy as np
+from .model_wrapper import Model
 
-# ffnn_wrapper.py
+class NeuronUpdater:
 
-class Model:
+    def __init__(self, model): 
+        if isinstance(model, keras.Sequential):
+            self.model = model
+        elif isinstance(model, Model):
+            self.model = model.get_modelo()
+        else:
+            raise ValueError("'model' must be either keras.Sequential or model_wrapper.Model")
 
-    def __init__(self,
-                    output_units=1,
-                    output_activation='linear',
-                    alpha=0.0001,
-                    random_state=42,
-                    name : str="some_model",
-                    autocompile : bool=False,
-                    manual : bool=False,
-                    validation: str=""
-                    ):
 
-        self.output_units = output_units
-        self.output_activation = output_activation
-        self.alpha = alpha
-        self.random_state = random_state
-        self.name = name
-        self.validation = validation
+    def validated_neuron_update(
+        self,
+        global_weights,
+        percentual: float = 0.2,
+        alpha: float=None,
+        X_val: list=None,
+        y_val: list=None,
+        keep_head_local: bool = True,
+        layer_decay: float = 0.5,
+        rng=None,
+        verbose: bool = True
+    ):
 
-        if not manual:
-            self.model = self._criar_modelo()
-        if autocompile:
-            self.compilar()
+        """
+            Update a fraction of the current network's neurons with a given set of global neurons;
+            Both sets must have identical shapes and numbers of layers.
+            Goal: to provide a robust percentage based neuron update in a highly heterogenous environment.
 
-    def _criar_modelo(self):
+            Parameters:
 
-        tf.random.set_seed(self.random_state)
-        np.random.seed(self.random_state)
-        python_random.seed(self.random_state)
+            global_weights : list[np.ndarray]
+                Weights returned by get_pesos() of the global model.
+            percentual : float, 0.0 < percentual <= 1.0
+                Fraction of neurons updated per layer (unchanged contract).
+            alpha : float, 0.0 < alpha <= 1.0
+                Base blending strength. alpha = 1.0 reproduces hard replacement.
+            X_val, y_val : optional
+                Small local validation split (e.g. the client's own last cycles).
+                If given, the update is only kept when local error does not get worse,
+                and alpha is chosen from a tiny candidate list by local validation.
+            keep_head_local : bool
+                Keep the output layer fully local (personalization head).
+            layer_decay : float
+                Per-layer damping: effective alpha of layer i is alpha * layer_decay**i,
+                so early (feature) layers absorb more global knowledge than late ones.
+            rng : np.random.Generator, optional
+                Pass a persistent generator so different neurons are drawn each round.
+        """
 
-        l2_reg = regularizers.l2(self.alpha)
-        initializer = initializers.Orthogonal()
+        if not (0.0 < percentual <= 1.0):
+            raise ValueError("percentual must satisfy 0.0 < percentual <= 1.0")
+        if alpha is None:
+            alpha = self.alpha
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("alpha must satisfy 0.0 < alpha <= 1.0")
 
-        modelo = keras.Sequential([
-            keras.Input(shape=(3,), batch_size=1),
-            layers.Dense(50, kernel_initializer=initializer, activation='tanh',
-                         kernel_regularizer=l2_reg),
-            layers.Dense(25, kernel_initializer=initializer, activation='tanh',
-                         kernel_regularizer=l2_reg),
-            layers.Dense(self.output_units, activation=self.output_activation,
-                        kernel_regularizer=l2_reg)
-        ])
+        local_weights = self.model.get_weights()
+        if len(global_weights) != len(local_weights):
+            raise ValueError("layer number mismatch between global and local models")
 
-        print(f"model {self.name} was created")
-        return modelo
+        if rng is None:
+            rng = np.random.default_rng(self.random_state)
 
-    def compilar(self, optimizer=None, loss='mse', metrics=['mae']):
-        if optimizer is None:
-          optimizer = Adam(learning_rate=0.001, beta_1=0.9,
-                          beta_2=0.999, epsilon=1e-08)
-        self.model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
-        print(f"model {self.name} was compiled")
+        n_layers = len(local_weights) // 2
+        last_layer = n_layers - 1
 
-    def treinar(self, X_train, y_train):
-        tf.random.set_seed(self.random_state)
-        np.random.seed(self.random_state)
-        python_random.seed(self.random_state)
+        def _blend(a_base):
+            """Build one candidate weight list for a given base alpha."""
+            updated = [w.copy() for w in local_weights]
 
-        history = self.model.fit(
-            X_train, y_train,
-            epochs=800,
-            batch_size=200,
-            validation_split=0.2,
-            verbose=0
-        )
+            for i in range(n_layers):
+                if keep_head_local and i == last_layer: # dont update output layer
+                    continue
 
-        return history
+                idx_k, idx_b = 2 * i, 2 * i + 1
+                k_loc, b_loc = updated[idx_k], updated[idx_b]
+                k_glb, b_glb = global_weights[idx_k], global_weights[idx_b]
+
+                if k_loc.shape != k_glb.shape or b_loc.shape != b_glb.shape:
+                    raise ValueError(f"shape mismatch on layer {i}")
+
+                num_neurons = b_loc.shape[0]
+                n_to_update = max(1, min(num_neurons,
+                                        int(np.round(num_neurons * percentual))))
+
+                # --- heterogeneity-aware selection -------------------------------
+                # Neurons that drifted most from the global model are the ones this
+                # client over-specialized; they are the useful ones to pull back.
+                drift = np.linalg.norm(k_glb - k_loc, axis=0) + np.abs(b_glb - b_loc)
+                total = drift.sum()
+                if total <= 0 or not np.isfinite(total):
+                    chosen = rng.choice(num_neurons, size=n_to_update, replace=False)
+                else:
+                    # probabilistic, drift-weighted: keeps randomness (no layer gets
+                    # frozen into the same neurons every round) but favours drift.
+                    p = drift / total
+                    chosen = rng.choice(num_neurons, size=n_to_update,
+                                        replace=False, p=p)
+
+                # --- damped, per-layer blending ----------------------------------
+                a_eff = float(np.clip(a_base * (layer_decay ** i), 0.0, 1.0))
+                if a_eff <= 0.0:
+                    continue
+
+                k_loc[:, chosen] = (1.0 - a_eff) * k_loc[:, chosen] + a_eff * k_glb[:, chosen]
+                b_loc[chosen] = (1.0 - a_eff) * b_loc[chosen] + a_eff * b_glb[chosen]
+
+            return updated
+
+        # update without validation if no validation is available
+        if X_val is None or y_val is None:
+            self.model.set_weights(_blend(alpha))
+            if verbose:
+                print(f"--- update applied (alpha={alpha}, percentual={percentual}) ---")
+            return {"alpha": alpha, "accepted": True}
+
+        # try to validate before updating
+        def _rmse(weights):
+            self.model.set_weights(weights)
+            avg_rmse = n = 0
+            for X, y in zip(X_val, y_val):
+                pred = np.asarray(self.model.predict(X, verbose=0)).ravel()
+                avg_rmse += float(np.sqrt(np.mean((np.asarray(y).ravel() - pred) ** 2)))
+                n += 1
+            return avg_rmse / n
+
+        base_rmse = _rmse(local_weights)
+
+        best_w, best_rmse, best_a = local_weights, base_rmse, 0.0
+        for a in (alpha * 0.25, alpha * 0.5, alpha):
+            cand = _blend(a)
+            r = _rmse(cand)
+            if np.isfinite(r) and r < best_rmse:
+                best_w, best_rmse, best_a = cand, r, a
+
+        self.model.set_weights(best_w)
+
+        accepted = best_a > 0.0
+        if verbose:
+            if accepted:
+                print(f"--- weights updated ---")
+            else:
+                print(f"--- LOCAL WEIGHTS WERE KEPT SINCE NO ALPHA IMPROVED THE RMSE ---")
+
 
     def neuron_update_interpolated(
         self,
@@ -84,7 +160,7 @@ class Model:
         alpha: float = 0.5,
         importance: str = "drift",
         keep_head_local: bool = True,
-        verbose: bool = True,
+        verbose: bool = True
     ):
 
         """
@@ -158,7 +234,12 @@ class Model:
         if verbose:
             print(f"--- neuron update done ---")
 
-    def neurons_update(self, global_weights, percentual: float=0.1, verbose: bool=True):
+
+    def neurons_update(self,
+        global_weights,
+        percentual: float=0.1,
+        verbose: bool=True
+    ):
 
         """
         Parametros:
@@ -206,7 +287,12 @@ class Model:
         if verbose:
             print("--- updates successfull ---")
 
-    def weights_update(self, global_weights, percentual: float=0.1, verbose: bool=True):
+
+    def weights_update(self,
+        global_weights,
+        percentual: float=0.1,
+        verbose: bool=True
+    ):
 
         """
         Parameters:
@@ -254,27 +340,3 @@ class Model:
         self.model.set_weights(updated)
         if verbose:
             print("--- updates successfull ---")
-
-    def set_modelo(self, modelo):
-        self.model = modelo
-
-    def get_modelo(self):
-        return self.model
-
-    def set_pesos(self, weights):
-        self.model.set_weights(weights)
-
-    def get_pesos(self):
-        return self.model.get_weights()
-
-    def salvar_modelo(self, caminho):
-      self.model.save(caminho, include_optimizer=True)
-
-    def prever(self, X):
-        return self.model.predict(X, verbose=0)
-
-    def resumo(self):
-        return self.model.summary()
-
-    def config(self):
-        return self.model.get_config()

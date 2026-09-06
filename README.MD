@@ -1,6 +1,6 @@
 # Federated learning (FL) with Keras
 
-Pandas and tf.keras based project for battery State of Charge (SoC) estimation in a federated learning (FL) setting - heterogeneous datasets.
+tf.keras based project for battery State of Charge (SoC) estimation in a federated learning (FL) setting - heterogeneous datasets from first, second and third life battery cells.
 
 ## Requirements 
 Download the required extensions with the uv package manager:
@@ -8,11 +8,6 @@ Download the required extensions with the uv package manager:
     uv sync
 ```
 NOTICE: See https://www.tensorflow.org/install/ for additional configuration requirements.  
-
-## Usage
-```python
-    
-```
 
 ## Project structure
 ```markdown
