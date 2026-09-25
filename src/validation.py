@@ -77,22 +77,6 @@ def test_on_validation_cell(models, inputs, validation: str="c3026", cicles:list
 
     return results
 
-
-def dump_to_excel(results: dict, path, validation="c3026"):
-    cells = ["c3023", "c3024", "c3025", "c3026", "c3027"]
-    cells = [cell for cell in cells if cell != validation]
-
-    df = pd.DataFrame()
-    for cell, d in results.items():
-        for metric, values in d.items():
-            df[f"cell_{cell}_{metric}"] = pd.Series(values)
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Excel file not found: {path}")
-    df.to_excel(path)
-    print(f"values written on {path}")
-    
-
 def basic_test(modelos, inputs_teste, ciclo: str=None):
     if ciclo is None:
         ciclo = "039"
